@@ -163,25 +163,22 @@ class OpenAIVectorizeModel(VectorizeModelABC):
 
                     assert len(all_embeddings) == len(texts)
                     return all_embeddings
-                elif isinstance(texts, str) and not texts.strip():
-                    texts = "none"
-
-                results = await self.aclient.embeddings.create(
-                    input=texts, model=self.model
-                )
+                else:
+                    # Handle single string input
+                    if isinstance(texts, str) and not texts.strip():
+                        texts = "none"
+                    results = await self.aclient.embeddings.create(
+                        input=texts, model=self.model
+                    )
+                    results = [item.embedding for item in results.data]
+                    assert len(results) == 1
+                    return results[0]
             except Exception as e:
                 logger.error(f"Error: {e}")
                 logger.error(f"input: {texts}")
                 logger.error(f"model: {self.model}")
                 logger.error(f"timeout: {self.timeout}")
                 return None
-        results = [item.embedding for item in results.data]
-        if isinstance(texts, str):
-            assert len(results) == 1
-            return results[0]
-        else:
-            assert len(results) == len(texts)
-            return results
 
 
 @VectorizeModelABC.register("azure_openai")
