@@ -9,11 +9,14 @@
 # is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 # or implied.
 
-from typing import Union, Iterable
+from typing import Union, Iterable, List
 from openai import OpenAI, AsyncOpenAI, AzureOpenAI, AsyncAzureOpenAI
 from kag.interface import VectorizeModelABC, EmbeddingVector
 from typing import Callable
 import logging
+
+# Default batch size for embedding API calls
+DEFAULT_BATCH_SIZE = 10
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +37,7 @@ class OpenAIVectorizeModel(VectorizeModelABC):
         timeout: float = None,
         max_rate: float = 1000,
         time_period: float = 1,
+        batch_size: int = DEFAULT_BATCH_SIZE,
         **kwargs,
     ):
         """
@@ -44,12 +48,14 @@ class OpenAIVectorizeModel(VectorizeModelABC):
             api_key (str, optional): The API key for accessing the OpenAI service. Defaults to "".
             base_url (str, optional): The base URL for the OpenAI service. Defaults to "".
             vector_dimensions (int, optional): The number of dimensions for the embedding vectors. Defaults to None.
+            batch_size (int, optional): Maximum number of texts to process in a single API call. Defaults to 10.
         """
         api_key = api_key if api_key else "abc123"
         name = self.generate_key(base_url, model, api_key)
         super().__init__(name, vector_dimensions, max_rate, time_period)
         self.model = model
         self.timeout = timeout
+        self.batch_size = batch_size
         self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=self.timeout)
         self.aclient = AsyncOpenAI(
             api_key=api_key, base_url=base_url, timeout=self.timeout
@@ -58,6 +64,10 @@ class OpenAIVectorizeModel(VectorizeModelABC):
     @classmethod
     def generate_key(cls, base_url, model, api_key, *args, **kwargs) -> str:
         return f"{cls}_{base_url}_{model}_{api_key}"
+
+    def _split_into_batches(self, items: List, batch_size: int) -> List[List]:
+        """Split a list into batches of specified size."""
+        return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
 
     def vectorize(
         self, texts: Union[str, Iterable[str]]
@@ -85,12 +95,16 @@ class OpenAIVectorizeModel(VectorizeModelABC):
                 if not filtered_texts:
                     return [[] for _ in texts]  # Return empty vectors for all inputs
 
-                results = self.client.embeddings.create(
-                    input=filtered_texts, model=self.model
-                )
+                # Split filtered texts into batches to avoid API batch size limits
+                batches = self._split_into_batches(filtered_texts, self.batch_size)
+                embeddings = []
+                for batch in batches:
+                    results = self.client.embeddings.create(
+                        input=batch, model=self.model
+                    )
+                    embeddings.extend([item.embedding for item in results.data])
 
                 # Reconstruct the results with empty lists for empty strings
-                embeddings = [item.embedding for item in results.data]
                 full_results = []
                 embedding_idx = 0
 
@@ -133,24 +147,38 @@ class OpenAIVectorizeModel(VectorizeModelABC):
             Union[EmbeddingVector, Iterable[EmbeddingVector]]: The embedding vector(s) of the text(s).
         """
         async with self.limiter:
-            texts = [text if text.strip() != "" else "none" for text in texts]
             try:
-                results = await self.aclient.embeddings.create(
-                    input=texts, model=self.model
-                )
+                if isinstance(texts, list):
+                    # Handle empty strings by replacing them with placeholder
+                    processed_texts = [text if text.strip() != "" else "none" for text in texts]
+
+                    # Split into batches to avoid API batch size limits
+                    batches = self._split_into_batches(processed_texts, self.batch_size)
+                    all_embeddings = []
+                    for batch in batches:
+                        results = await self.aclient.embeddings.create(
+                            input=batch, model=self.model
+                        )
+                        all_embeddings.extend([item.embedding for item in results.data])
+
+                    assert len(all_embeddings) == len(texts)
+                    return all_embeddings
+                else:
+                    # Handle single string input
+                    if isinstance(texts, str) and not texts.strip():
+                        texts = "none"
+                    results = await self.aclient.embeddings.create(
+                        input=texts, model=self.model
+                    )
+                    results = [item.embedding for item in results.data]
+                    assert len(results) == 1
+                    return results[0]
             except Exception as e:
                 logger.error(f"Error: {e}")
                 logger.error(f"input: {texts}")
                 logger.error(f"model: {self.model}")
                 logger.error(f"timeout: {self.timeout}")
                 return None
-        results = [item.embedding for item in results.data]
-        if isinstance(texts, str):
-            assert len(results) == 1
-            return results[0]
-        else:
-            assert len(results) == len(texts)
-            return results
 
 
 @VectorizeModelABC.register("azure_openai")
@@ -172,6 +200,7 @@ class AzureOpenAIVectorizeModel(VectorizeModelABC):
         azure_ad_token_provider: Callable = None,
         max_rate: float = 1000,
         time_period: float = 1,
+        batch_size: int = DEFAULT_BATCH_SIZE,
     ):
         """
         Initializes the AzureOpenAIVectorizeModel instance.
@@ -186,11 +215,13 @@ class AzureOpenAIVectorizeModel(VectorizeModelABC):
             azure_ad_token_provider: A function that returns an Azure Active Directory token, will be invoked on every request.
             azure_deployment: A model deployment, if given sets the base client URL to include `/deployments/{azure_deployment}`.
                 Note: this means you won't be able to use non-deployment endpoints. Not supported with Assistants APIs.
+            batch_size (int, optional): Maximum number of texts to process in a single API call. Defaults to 10.
         """
         name = self.generate_key(api_key, base_url, model)
         super().__init__(name, vector_dimensions, max_rate, time_period)
         self.model = model
         self.timeout = timeout
+        self.batch_size = batch_size
         self.client = AzureOpenAI(
             api_key=api_key,
             base_url=base_url,
@@ -216,6 +247,10 @@ class AzureOpenAIVectorizeModel(VectorizeModelABC):
     def generate_key(cls, base_url, api_key, model, *args, **kwargs) -> str:
         return f"{cls}_{base_url}_{api_key}_{model}"
 
+    def _split_into_batches(self, items: List, batch_size: int) -> List[List]:
+        """Split a list into batches of specified size."""
+        return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
+
     def vectorize(
         self, texts: Union[str, Iterable[str]]
     ) -> Union[EmbeddingVector, Iterable[EmbeddingVector]]:
@@ -228,14 +263,21 @@ class AzureOpenAIVectorizeModel(VectorizeModelABC):
         Returns:
             Union[EmbeddingVector, Iterable[EmbeddingVector]]: The embedding vector(s) of the text(s).
         """
-        results = self.client.embeddings.create(input=texts, model=self.model)
-        results = [item.embedding for item in results.data]
         if isinstance(texts, str):
+            results = self.client.embeddings.create(input=texts, model=self.model)
+            results = [item.embedding for item in results.data]
             assert len(results) == 1
             return results[0]
         else:
-            assert len(results) == len(texts)
-            return results
+            # Split texts into batches to avoid API batch size limits
+            texts_list = list(texts)
+            batches = self._split_into_batches(texts_list, self.batch_size)
+            all_embeddings = []
+            for batch in batches:
+                results = self.client.embeddings.create(input=batch, model=self.model)
+                all_embeddings.extend([item.embedding for item in results.data])
+            assert len(all_embeddings) == len(texts_list)
+            return all_embeddings
 
     async def avectorize(
         self, texts: Union[str, Iterable[str]]
@@ -250,16 +292,25 @@ class AzureOpenAIVectorizeModel(VectorizeModelABC):
             Union[EmbeddingVector, Iterable[EmbeddingVector]]: The embedding vector(s) of the text(s).
         """
         async with self.limiter:
-            results = await self.aclient.embeddings.create(
-                input=texts, model=self.model
-            )
-        results = [item.embedding for item in results.data]
-        if isinstance(texts, str):
-            assert len(results) == 1
-            return results[0]
-        else:
-            assert len(results) == len(texts)
-            return results
+            if isinstance(texts, str):
+                results = await self.aclient.embeddings.create(
+                    input=texts, model=self.model
+                )
+                results = [item.embedding for item in results.data]
+                assert len(results) == 1
+                return results[0]
+            else:
+                # Split texts into batches to avoid API batch size limits
+                texts_list = list(texts)
+                batches = self._split_into_batches(texts_list, self.batch_size)
+                all_embeddings = []
+                for batch in batches:
+                    results = await self.aclient.embeddings.create(
+                        input=batch, model=self.model
+                    )
+                    all_embeddings.extend([item.embedding for item in results.data])
+                assert len(all_embeddings) == len(texts_list)
+                return all_embeddings
 
 
 if __name__ == "__main__":
