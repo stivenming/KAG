@@ -106,8 +106,8 @@ class TestOpenAIVectorizeModelBatching:
 
         # Setup mock client
         mock_client = MagicMock()
-        mock_client.embeddings.create.side_effect = lambda input, model: create_mock_response(
-            input
+        mock_client.embeddings.create.side_effect = lambda **kwargs: create_mock_response(
+            kwargs["input"]
         )
         mock_openai.return_value = mock_client
 
@@ -159,8 +159,8 @@ class TestOpenAIVectorizeModelBatching:
             return mock_response
 
         mock_client = MagicMock()
-        mock_client.embeddings.create.side_effect = lambda input, model: create_mock_response(
-            input
+        mock_client.embeddings.create.side_effect = lambda **kwargs: create_mock_response(
+            kwargs["input"]
         )
         mock_openai.return_value = mock_client
 
