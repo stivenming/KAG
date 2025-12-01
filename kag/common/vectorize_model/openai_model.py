@@ -34,6 +34,7 @@ class OpenAIVectorizeModel(VectorizeModelABC):
         timeout: float = None,
         max_rate: float = 1000,
         time_period: float = 1,
+        batch_size: int = 10,
         **kwargs,
     ):
         """
@@ -44,12 +45,14 @@ class OpenAIVectorizeModel(VectorizeModelABC):
             api_key (str, optional): The API key for accessing the OpenAI service. Defaults to "".
             base_url (str, optional): The base URL for the OpenAI service. Defaults to "".
             vector_dimensions (int, optional): The number of dimensions for the embedding vectors. Defaults to None.
+            batch_size (int, optional): Maximum number of texts to send in a single API request. Defaults to 10.
         """
         api_key = api_key if api_key else "abc123"
         name = self.generate_key(base_url, model, api_key)
         super().__init__(name, vector_dimensions, max_rate, time_period)
         self.model = model
         self.timeout = timeout
+        self.batch_size = batch_size
         self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=self.timeout)
         self.aclient = AsyncOpenAI(
             api_key=api_key, base_url=base_url, timeout=self.timeout
@@ -85,12 +88,16 @@ class OpenAIVectorizeModel(VectorizeModelABC):
                 if not filtered_texts:
                     return [[] for _ in texts]  # Return empty vectors for all inputs
 
-                results = self.client.embeddings.create(
-                    input=filtered_texts, model=self.model
-                )
+                # Process filtered_texts in batches
+                embeddings = []
+                for i in range(0, len(filtered_texts), self.batch_size):
+                    batch = filtered_texts[i : i + self.batch_size]
+                    results = self.client.embeddings.create(
+                        input=batch, model=self.model
+                    )
+                    embeddings.extend([item.embedding for item in results.data])
 
                 # Reconstruct the results with empty lists for empty strings
-                embeddings = [item.embedding for item in results.data]
                 full_results = []
                 embedding_idx = 0
 
@@ -135,22 +142,26 @@ class OpenAIVectorizeModel(VectorizeModelABC):
         async with self.limiter:
             texts = [text if text.strip() != "" else "none" for text in texts]
             try:
-                results = await self.aclient.embeddings.create(
-                    input=texts, model=self.model
-                )
+                # Process texts in batches
+                all_results = []
+                for i in range(0, len(texts), self.batch_size):
+                    batch = texts[i : i + self.batch_size]
+                    results = await self.aclient.embeddings.create(
+                        input=batch, model=self.model
+                    )
+                    all_results.extend([item.embedding for item in results.data])
             except Exception as e:
                 logger.error(f"Error: {e}")
                 logger.error(f"input: {texts}")
                 logger.error(f"model: {self.model}")
                 logger.error(f"timeout: {self.timeout}")
                 return None
-        results = [item.embedding for item in results.data]
         if isinstance(texts, str):
-            assert len(results) == 1
-            return results[0]
+            assert len(all_results) == 1
+            return all_results[0]
         else:
-            assert len(results) == len(texts)
-            return results
+            assert len(all_results) == len(texts)
+            return all_results
 
 
 @VectorizeModelABC.register("azure_openai")
